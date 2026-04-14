@@ -53,27 +53,33 @@ jobs:
         if: runner.os == 'macOS' && steps.cache-qt.outputs.cache-hit != 'true'
         run: brew install ninja
 
-      - name: Build static Qt6
-        if: steps.cache-qt.outputs.cache-hit != 'true'
-        shell: bash
+      - name: Build static Qt6 (Unix)
+        if: steps.cache-qt.outputs.cache-hit != 'true' && runner.os != 'Windows'
         run: |
           git clone --depth 1 --branch v6.7.3 https://code.qt.io/qt/qt5.git qt6-src
           cd qt6-src && perl init-repository --module-subset=qtbase && cd ..
           mkdir qt6-build && cd qt6-build
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            ../qt6-src/configure.bat -static -release \
-              -prefix "${{ github.workspace }}/qt6-static" \
-              -no-pch -nomake examples -nomake tests -submodules qtbase
-          else
-            ../qt6-src/configure -static -release \
-              -prefix "${{ github.workspace }}/qt6-static" \
-              -no-pch -nomake examples -nomake tests -submodules qtbase -- -GNinja
-          fi
+          ../qt6-src/configure -static -release \
+            -prefix "${{ github.workspace }}/qt6-static" \
+            -no-pch -nomake examples -nomake tests -submodules qtbase -- -GNinja
           cmake --build . --parallel
           cmake --install .
         timeout-minutes: 45
 
+      - name: Build static Qt6 (Windows)
+        if: steps.cache-qt.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: cmd
+        run: |
+          git clone --depth 1 --branch v6.7.3 https://code.qt.io/qt/qt5.git qt6-src
+          cd qt6-src && perl init-repository --module-subset=qtbase && cd ..
+          mkdir qt6-build && cd qt6-build
+          call "${{ github.workspace }}\qt6-src\configure.bat" -static -release -prefix "${{ github.workspace }}\qt6-static" -no-pch -nomake examples -nomake tests -submodules qtbase
+          cmake --build . --parallel --config Release
+          cmake --install .
+        timeout-minutes: 60
+
       - name: Install dependencies (Linux)
+
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -102,6 +108,7 @@ jobs:
         run: |
           mkdir -p dist
           cp build/Release/*.exe dist/ 2>/dev/null || true
+          for exe in dist/*.exe; do windeployqt "$exe" 2>/dev/null || true; done
           7z a ${{ matrix.artifact }}.zip ./dist/*
 
       - name: Upload artifact
