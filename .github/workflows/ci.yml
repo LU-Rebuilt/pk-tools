@@ -5,6 +5,34 @@ on:
     branches: [main]
 
 jobs:
+  commit-lint:
+    name: Conventional Commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR commits
+        run: |
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+'
+          FAILED=0
+          while IFS= read -r msg; do
+            if ! echo "$msg" | grep -qE "$PATTERN"; then
+              echo "::error::Bad commit message: $msg"
+              echo "  Expected format: type(scope): description"
+              echo "  Types: feat fix docs style refactor perf test build ci chore revert"
+              FAILED=1
+            fi
+          done < <(git log --format='%s' origin/main..HEAD)
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "All commits must follow Conventional Commits: https://www.conventionalcommits.org"
+            exit 1
+          fi
+          echo "All commits follow conventional commit format."
+
   build:
     strategy:
       fail-fast: false
@@ -19,9 +47,11 @@ jobs:
           - os: macos-14
             name: macos-arm64
             artifact: pk-tools-macos-arm64
+            cmake_extra: -DCMAKE_OSX_ARCHITECTURES=arm64
           - os: macos-14
             name: macos-x86_64
             artifact: pk-tools-macos-x86_64
+            cmake_extra: -DCMAKE_OSX_ARCHITECTURES=x86_64
 
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}

@@ -19,9 +19,11 @@ jobs:
           - os: macos-14
             name: macos-arm64
             artifact: pk-tools-macos-arm64
+            cmake_extra: -DCMAKE_OSX_ARCHITECTURES=arm64
           - os: macos-14
             name: macos-x86_64
             artifact: pk-tools-macos-x86_64
+            cmake_extra: -DCMAKE_OSX_ARCHITECTURES=x86_64
 
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -52,12 +54,35 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Package (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          cp build/pk_extractor pk_viewer dist/ 2>/dev/null || true
+          cp build/pk_extractor dist/ 2>/dev/null || true; cp build/pk_viewer dist/ 2>/dev/null || true;
           tar -czf ${{ matrix.artifact }}.tar.gz -C dist .
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          APP=dist/PKTools.app
+          mkdir -p "$APP/Contents/MacOS"
+          cp build/pk_extractor "$APP/Contents/MacOS/" 2>/dev/null || true
+          cp build/pk_viewer "$APP/Contents/MacOS/" 2>/dev/null || true
+          cat > "$APP/Contents/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>pk_extractor</string>
+            <key>CFBundleName</key><string>PKTools</string>
+            <key>CFBundleIdentifier</key><string>com.lu-rebuilt.pktools</string>
+            <key>CFBundleVersion</key><string>1.0</string>
+          </dict>
+          </plist>
+          PLIST
+          macdeployqt "$APP" -verbose=1
+          cd dist && zip -r ../${{ matrix.artifact }}.zip PKTools.app
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -81,14 +106,88 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate release notes
+        id: notes
+        run: |
+          CURRENT_TAG="${GITHUB_REF#refs/tags/}"
+          PREV_TAG=$(git tag --sort=-creatordate | grep -A1 "^${CURRENT_TAG}$" | tail -1)
+          TAG_MSG=$(git tag -l --format='%(contents)' "$CURRENT_TAG" | head -20)
+
+          {
+            echo 'BODY<<ENDOFNOTES'
+
+            if [ -n "$TAG_MSG" ] && [ "$TAG_MSG" != "$CURRENT_TAG" ]; then
+              echo "$TAG_MSG"
+              echo ""
+            fi
+
+            if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$CURRENT_TAG" ]; then
+              RANGE="${PREV_TAG}..${CURRENT_TAG}"
+            else
+              RANGE="HEAD~20..HEAD"
+            fi
+
+            COMMITS=$(git log "$RANGE" --pretty=format:"%s" --no-merges)
+
+            BREAKING=$(echo "$COMMITS" | grep -E '^[a-z]+(\(.+\))?!: ' | sed 's/^/- /' || true)
+            FEAT=$(echo "$COMMITS" | grep -E '^feat(\(.+\))?: ' | sed 's/^/- /' || true)
+            FIX=$(echo "$COMMITS" | grep -E '^fix(\(.+\))?: ' | sed 's/^/- /' || true)
+            PERF=$(echo "$COMMITS" | grep -E '^perf(\(.+\))?: ' | sed 's/^/- /' || true)
+            DOCS=$(echo "$COMMITS" | grep -E '^docs(\(.+\))?: ' | sed 's/^/- /' || true)
+            CI_BUILD=$(echo "$COMMITS" | grep -E '^(ci|build)(\(.+\))?: ' | sed 's/^/- /' || true)
+            OTHER=$(echo "$COMMITS" | grep -vE '^(feat|fix|perf|docs|ci|build|style|refactor|test|chore|revert)(\(.+\))?!?: ' | sed 's/^/- /' || true)
+
+            if [ -n "$BREAKING" ]; then
+              echo "### ⚠ Breaking Changes"
+              echo "$BREAKING"
+              echo ""
+            fi
+            if [ -n "$FEAT" ]; then
+              echo "### Features"
+              echo "$FEAT"
+              echo ""
+            fi
+            if [ -n "$FIX" ]; then
+              echo "### Bug Fixes"
+              echo "$FIX"
+              echo ""
+            fi
+            if [ -n "$PERF" ]; then
+              echo "### Performance"
+              echo "$PERF"
+              echo ""
+            fi
+            if [ -n "$DOCS" ]; then
+              echo "### Documentation"
+              echo "$DOCS"
+              echo ""
+            fi
+            if [ -n "$CI_BUILD" ]; then
+              echo "### Build & CI"
+              echo "$CI_BUILD"
+              echo ""
+            fi
+            if [ -n "$OTHER" ]; then
+              echo "### Other Changes"
+              echo "$OTHER"
+              echo ""
+            fi
+
+            echo 'ENDOFNOTES'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          generate_release_notes: true
+          body: ${{ steps.notes.outputs.BODY }}
