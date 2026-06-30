@@ -19,9 +19,13 @@ FetchContent_Declare(tool_common
 )
 FetchContent_MakeAvailable(tool_common)
 
-# CLI extractor
+# CLI extractor (single .pk file, entries named by index)
 add_executable(pk_extractor src/pk_extractor.cpp)
 target_link_libraries(pk_extractor PRIVATE lu_assets)
+
+# CLI unpacker (full client, manifest-based filename resolution)
+add_executable(pk_unpack src/pk_unpack.cpp)
+target_link_libraries(pk_unpack PRIVATE lu_assets)
 
 # GUI viewer (optional, requires Qt6)
 find_package(Qt6 COMPONENTS Widgets Concurrent QUIET)
