@@ -1,6 +1,11 @@
 #include "main_window.h"
 #include "file_browser.h"
 
+#include "gamebryo/nif/nif_reader.h"
+#include "gamebryo/kfm/kfm_reader.h"
+#include "netdevil/zone/luz/luz_reader.h"
+#include "forkparticle/psb/psb_reader.h"
+
 #include <QMenuBar>
 #include <QStatusBar>
 #include <QFileDialog>
@@ -23,6 +28,8 @@
 
 #include <algorithm>
 #include <mutex>
+#include <cstring>
+#include <string_view>
 
 namespace pk_viewer {
 
@@ -93,6 +100,8 @@ MainWindow::MainWindow(QWidget* parent)
     fileMenu->addSeparator();
     fileMenu->addAction("Set &Client Root...", QKeySequence("Ctrl+R"),
                         this, &MainWindow::onSetClientRoot);
+    fileMenu->addAction("Open SD0 &Folder...",
+                        this, &MainWindow::onOpenSd0Folder);
     fileMenu->addSeparator();
     fileMenu->addAction("Extract &Selected...", QKeySequence("Ctrl+E"),
                         this, &MainWindow::onExtractSelected);
@@ -307,6 +316,88 @@ void MainWindow::onSetClientRoot() {
     loadClientRoot(dir);
 }
 
+void MainWindow::onOpenSd0Folder() {
+    QSettings settings;
+    QString lastDir = settings.value("pk_last_sd0_dir").toString();
+
+    QString dir = QFileDialog::getExistingDirectory(
+        this, "Open Folder of .sd0 Files", lastDir,
+        QFileDialog::DontUseNativeDialog);
+    if (dir.isEmpty()) return;
+
+    settings.setValue("pk_last_sd0_dir", dir);
+    loadSd0Folder(dir);
+}
+
+void MainWindow::loadSd0Folder(const QString& dir) {
+    // Recursively find every .sd0 file under dir, decompress each one, and show it in
+    // the tree the same way a packed entry would appear — one LoadedPack per file (so
+    // extraction/type-detection/search all work unchanged), with detectFileType run
+    // against the decompressed bytes to identify what format each one actually holds.
+    QStringList sd0Files;
+    QDirIterator it(dir, QStringList() << "*.sd0", QDir::Files,
+                     QDirIterator::Subdirectories);
+    while (it.hasNext()) sd0Files << it.next();
+    sd0Files.sort();
+
+    if (sd0Files.isEmpty()) {
+        QMessageBox::information(this, "No SD0 Files",
+            QString("No .sd0 files found under:\n%1").arg(dir));
+        return;
+    }
+
+    QProgressDialog progress("Decompressing SD0 files...", "Cancel", 0, sd0Files.size(), this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(200);
+
+    std::vector<LoadedPack> results;
+    results.reserve(static_cast<size_t>(sd0Files.size()));
+    int failed = 0;
+
+    for (int i = 0; i < sd0Files.size(); ++i) {
+        progress.setValue(i);
+        if (progress.wasCanceled()) break;
+
+        const QString& path = sd0Files[i];
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) { failed++; continue; }
+        QByteArray raw = f.readAll();
+
+        LoadedPack pack;
+        pack.path = path;
+        QString baseName = QFileInfo(path).fileName();
+        // Strip the .sd0 suffix so the tree/extraction show the file's real name
+        // (e.g. "level.lvl.sd0" -> "level.lvl") — matches how packed entries are shown.
+        pack.name = baseName.endsWith(".sd0", Qt::CaseInsensitive)
+            ? baseName.left(baseName.size() - 4) : baseName;
+        pack.loose_original_name = pack.name;
+
+        try {
+            pack.loose_data = lu::assets::sd0_decompress(std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(raw.constData()),
+                static_cast<size_t>(raw.size())));
+        } catch (const std::exception&) {
+            failed++;
+            continue;
+        }
+
+        results.push_back(std::move(pack));
+    }
+    progress.setValue(sd0Files.size());
+
+    packs_ = std::move(results);
+    clientRoot_.clear();
+    crcMap_.clear();
+    pki_ = lu::assets::PkiFile{};
+
+    setWindowTitle(QString("PK Viewer - %1 (SD0 folder)").arg(QFileInfo(dir).fileName()));
+    buildTree();
+
+    QString msg = QString("Loaded %1 SD0 file(s) from %2").arg(packs_.size()).arg(dir);
+    if (failed > 0) msg += QString(" (%1 failed to decompress)").arg(failed);
+    statusLabel_->setText(msg);
+}
+
 void MainWindow::loadManifest() {
     crcMap_.clear();
     if (clientRoot_.isEmpty()) return;
@@ -346,16 +437,9 @@ void MainWindow::loadManifest() {
 }
 
 void MainWindow::loadPki() {
-    pkiPackPaths_.clear();
-    crcToPackIdx_.clear();
+    pki_ = lu::assets::PkiFile{};
     if (clientRoot_.isEmpty()) return;
 
-    // PKI binary format (version 3):
-    //   u32 version
-    //   u32 pack_count
-    //   For each pack: u32 string_len + string (backslash-separated path)
-    //   u32 entry_count
-    //   For each entry (20 bytes): u32 crc, s32 lower, s32 upper, u32 pack_index, u32 unknown
     QStringList tryPaths = {
         clientRoot_ + "/versions/primary.pki",
         clientRoot_ + "/client/versions/primary.pki",
@@ -366,49 +450,13 @@ void MainWindow::loadPki() {
         if (!f.open(QIODevice::ReadOnly)) continue;
 
         QByteArray raw = f.readAll();
-        const uint8_t* d = reinterpret_cast<const uint8_t*>(raw.constData());
-        size_t size = static_cast<size_t>(raw.size());
-        size_t off = 0;
+        auto parsed = lu::assets::pki_parse(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(raw.constData()),
+            static_cast<size_t>(raw.size())));
+        if (parsed.pack_paths.empty()) continue;
 
-        auto read_u32 = [&]() -> uint32_t {
-            if (off + 4 > size) return 0;
-            uint32_t v = d[off] | (d[off+1]<<8) | (d[off+2]<<16) | (static_cast<uint32_t>(d[off+3])<<24);
-            off += 4;
-            return v;
-        };
-
-        uint32_t version = read_u32();
-        if (version < 1 || version > 10) continue; // sanity check
-
-        uint32_t packCount = read_u32();
-        if (packCount > 10000) continue;
-
-        for (uint32_t i = 0; i < packCount; ++i) {
-            uint32_t slen = read_u32();
-            if (off + slen > size) break;
-            std::string name(reinterpret_cast<const char*>(d + off), slen);
-            off += slen;
-            // Normalize to forward slashes
-            std::replace(name.begin(), name.end(), '\\', '/');
-            pkiPackPaths_.push_back(name);
-        }
-
-        uint32_t entryCount = read_u32();
-        if (off + entryCount * 20 > size) break;
-
-        for (uint32_t i = 0; i < entryCount; ++i) {
-            uint32_t crc = read_u32();
-            read_u32(); // lower_crc
-            read_u32(); // upper_crc
-            uint32_t packIdx = read_u32();
-            read_u32(); // unknown
-
-            if (packIdx < pkiPackPaths_.size()) {
-                crcToPackIdx_[crc] = static_cast<int>(packIdx);
-            }
-        }
-
-        if (!pkiPackPaths_.empty()) break;
+        pki_ = std::move(parsed);
+        break;
     }
 }
 
@@ -416,6 +464,32 @@ void MainWindow::buildTree() {
     tree_->clear();
     if (packs_.empty()) return;
 
+    // Loose SD0-folder mode: each pack IS a single decompressed file (archive == nullptr),
+    // so there's no pack-root/entry nesting — one flat row per file, entry index always 0.
+    // The on-disk name is just a content hash, so column 0 stays the hash (for locating
+    // the source .sd0) while column 4 (unused here — no pack offset applies) surfaces
+    // whatever real name detectFile() recovered from the file's own content.
+    if (!packs_[0].archive) {
+        tree_->setHeaderLabels({"Filename (hash)", "Size", "Compressed", "Type", "Detected Name"});
+        for (int pi = 0; pi < static_cast<int>(packs_.size()); ++pi) {
+            const auto& pack = packs_[pi];
+            DetectedFile detected = detectFile(pack.loose_data);
+
+            auto* item = new QTreeWidgetItem(tree_);
+            item->setText(0, pack.loose_original_name);
+            item->setText(1, formatSize(static_cast<uint32_t>(pack.loose_data.size())));
+            item->setText(2, "---");
+            item->setText(3, detected.type);
+            item->setText(4, detected.name);
+            item->setData(0, Qt::UserRole, pi);
+            item->setData(0, Qt::UserRole + 1, 0); // single synthetic entry
+            item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+        }
+        tree_->sortByColumn(3, Qt::AscendingOrder); // group by detected type by default
+        return;
+    }
+
+    tree_->setHeaderLabels({"Filename / CRC", "Size", "Compressed", "Type", "Offset"});
     bool multiPack = packs_.size() > 1;
 
     for (int pi = 0; pi < static_cast<int>(packs_.size()); ++pi) {
@@ -503,42 +577,191 @@ QString MainWindow::resolveFilename(uint32_t crc) const {
 }
 
 QString MainWindow::detectFileType(const std::vector<uint8_t>& data) const {
-    if (data.size() < 4) return "?";
+    return detectFile(data).type;
+}
 
-    uint32_t m32 = data[0] | (data[1] << 8) | (data[2] << 16) | (static_cast<uint32_t>(data[3]) << 24);
+namespace {
 
-    // Magic byte detection
-    if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') return "PNG";
-    if (data[0] == 'D' && data[1] == 'D' && data[2] == 'S' && data[3] == ' ') return "DDS";
-    if (data[0] == 'G' && data[1] == 'a' && data[2] == 'm' && data[3] == 'e') return "NIF";
-    if (data[0] == 'N' && data[1] == 'e' && data[2] == 't' && data[3] == 'I') return "NIF";
-    if (data[0] == ';' && data[1] == 'G' && data[2] == 'a' && data[3] == 'm') return "KFM";
-    if (data[0] == 'F' && data[1] == 'S' && data[2] == 'B') return "FSB";
-    if (data[0] == 'F' && data[1] == 'E' && data[2] == 'V') return "FEV";
-    if (data[0] == 'n' && data[1] == 'd' && data[2] == 'p' && data[3] == 'k') return "PK";
-    if (data[0] == 's' && data[1] == 'd' && data[2] == '0') return "SD0";
-    if (data[0] == 'C' && data[1] == 'F' && data[2] == 'X') return "GFX";
-    if (data[0] == 'F' && data[1] == 'W' && data[2] == 'S') return "GFX";
-    if (data[0] == 'C' && data[1] == 'W' && data[2] == 'S') return "GFX";
-    if (data[0] == 0xFF && data[1] == 0xD8) return "JPEG";
-    if (data[0] == '<') return "XML";
-    if (m32 == 0x42420D31) return "G";      // brick geometry
-    if (m32 == 0x57E0E057) return "HKX";    // havok binary
-    if (m32 == 4) return "FDB";              // FDB starts with table count (usually small u32)
+bool starts_with(const std::vector<uint8_t>& d, std::string_view s) {
+    return d.size() >= s.size() && std::memcmp(d.data(), s.data(), s.size()) == 0;
+}
+
+uint32_t read_u32le(const std::vector<uint8_t>& d, size_t off) {
+    return static_cast<uint32_t>(d[off]) | (static_cast<uint32_t>(d[off+1]) << 8) |
+           (static_cast<uint32_t>(d[off+2]) << 16) | (static_cast<uint32_t>(d[off+3]) << 24);
+}
+
+} // anonymous namespace
+
+// Identify the actual format of loose/decompressed file data — used both for PK entries
+// (where the manifest already gives a name/extension, so this mostly confirms it) and,
+// critically, for the SD0-folder mode where files are hash-named and this is the ONLY
+// signal available. Beyond magic bytes, small/cheap formats are structurally verified by
+// actually parsing them with the real lu-assets reader (not just sniffing the header),
+// and any name the format carries internally (a referenced .raw/.nif path, an FDB table
+// list, an NiNode name, ...) is surfaced so hash-named files get something meaningful.
+// Large/expensive formats (terrain .raw, FDB, HKX) are only header-peeked, not fully
+// parsed, so this stays fast even on the 2000+ files a loose SD0 folder can contain.
+DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
+    if (data.size() < 4) return {"?", ""};
+
+    uint32_t m32 = read_u32le(data, 0);
+
+    // ---- Gamebryo NIF container (.nif/.kf/.etk) — fully parsed: it's small (almost
+    // always well under 1MB) and parsing recovers the scene root's name for free. ----
+    if (starts_with(data, "Gamebryo File Format") || starts_with(data, "NetImmerse File Format")) {
+        try {
+            auto nif = lu::assets::nif_parse(std::span<const uint8_t>(data.data(), data.size()));
+            QString name;
+            if (!nif.nodes.empty() && !nif.nodes.front().name.empty()) {
+                name = QString::fromStdString(nif.nodes.front().name);
+            }
+            // .kf files carry animation (NiControllerSequence), not a scene graph.
+            QString type = !nif.sequences.empty() && nif.nodes.empty() ? "KF" : "NIF";
+            return {type, name};
+        } catch (const std::exception&) {
+            return {"NIF?", ""}; // right magic, but didn't parse — flag rather than hide it
+        }
+    }
+
+    // ---- KFM (keyframe manager) — fully parsed: tiny files, and model_path is exactly
+    // the kind of identifying name a hash-named loose file needs. ----
+    if (starts_with(data, ";Gamebryo KFM File Version")) {
+        try {
+            auto kfm = lu::assets::kfm_parse(std::span<const uint8_t>(data.data(), data.size()));
+            return {"KFM", QString::fromStdString(kfm.model_path_normalized())};
+        } catch (const std::exception&) {
+            return {"KFM?", ""};
+        }
+    }
+
+    // ---- LUZ (zone) — fully parsed: raw_path (the terrain file it references) is a
+    // good proxy for the zone's own identity. ----
+    if (data.size() >= 4) {
+        try {
+            auto luz = lu::assets::luz_parse(std::span<const uint8_t>(data.data(), data.size()));
+            if (luz.version >= 20 && luz.version <= 60 && !luz.scenes.empty()) {
+                return {"LUZ", QString::fromStdString(luz.raw_path)};
+            }
+        } catch (const std::exception&) {
+            // Not a LUZ — most files will hit this; fall through to other checks.
+        }
+    }
+
+    // ---- .settings (NiKFMTool binary) — matches the u8(5)+"2.3."... version-string
+    // signature identified while adding pki_write's round-trip coverage. ----
+    if (data.size() >= 6 && data[0] == 5 && std::memcmp(data.data() + 1, "2.3.", 4) == 0) {
+        return {"SET", ""};
+    }
+
+    // ---- Terrain .raw (chunked, version >= 30) — header-only: u16 version, u8 dev,
+    // u32 chunk_count/width/height, all in a narrow sane range. Never fully parsed here
+    // (files run to tens of MB and this is a browse/identify tool, not a validator). ----
+    if (data.size() >= 15) {
+        uint16_t rawVersion = static_cast<uint16_t>(data[0] | (data[1] << 8));
+        uint8_t rawDev = data[2];
+        if (rawVersion >= 30 && rawVersion <= 45 && rawDev == 0) {
+            uint32_t chunkCount = read_u32le(data, 3);
+            uint32_t chunksW = read_u32le(data, 7);
+            uint32_t chunksH = read_u32le(data, 11);
+            if (chunkCount > 0 && chunkCount <= 10000 && chunksW > 0 && chunksW <= 200 &&
+                chunksH > 0 && chunksH <= 200 && chunkCount == chunksW * chunksH) {
+                return {"RAW", ""};
+            }
+        }
+    }
+
+    // ---- FDB (CDClient-style database) — header-only: table_count(u32) followed by a
+    // plausible pointer/name-length field. Never fully parsed (files can be 10s of MB). ----
+    if (m32 == 4) return {"FDB", ""};
     if (data.size() >= 8 && data[4] == 0 && data[5] == 0 && data[6] == 0 && data[7] == 0
-        && m32 > 0 && m32 < 200) return "FDB"; // likely FDB (table count < 200, then null)
+        && m32 > 0 && m32 < 200) {
+        return {"FDB", ""};
+    }
 
-    // Lua bytecode
-    if (data.size() >= 4 && data[0] == 0x1B && data[1] == 'L' && data[2] == 'u' && data[3] == 'a') return "LUA";
-    // Lua source
-    if (data.size() >= 2 && data[0] == '-' && data[1] == '-') return "LUA";
+    // ---- ForkParticle PSB (binary emitter) — header_size is always 80 (0x50) with
+    // data_size 420 right after; found by cross-referencing PsbFile's documented layout
+    // against an unidentified magic bucket in a real SD0-folder corpus. Carries an
+    // optional emitter_name at a file-relative offset (psb_types.h +0x194/+0x198). ----
+    if (m32 == 80 && data.size() >= 8 && read_u32le(data, 4) == 420) {
+        try {
+            auto psb = lu::assets::psb_parse(std::span<const uint8_t>(data.data(), data.size()));
+            return {"PSB", QString::fromStdString(psb.emitter_name)};
+        } catch (const std::exception&) {
+            return {"PSB?", ""};
+        }
+    }
+
+    // ---- ForkParticle effect (text emitter description) — the sibling text format to
+    // PSB; carries the emitter name directly as its first line. ----
+    if (starts_with(data, "EMITTERNAME:")) {
+        std::string_view text(reinterpret_cast<const char*>(data.data()),
+                               std::min(data.size(), size_t(256)));
+        size_t nameStart = text.find(':') + 1;
+        size_t nameEnd = text.find_first_of("\r\n", nameStart);
+        QString name;
+        if (nameStart != std::string_view::npos && nameEnd != std::string_view::npos) {
+            std::string_view raw = text.substr(nameStart, nameEnd - nameStart);
+            // Trim leading/trailing whitespace.
+            size_t b = raw.find_first_not_of(' ');
+            size_t e = raw.find_last_not_of(' ');
+            if (b != std::string_view::npos) name = QString::fromUtf8(raw.substr(b, e - b + 1).data(),
+                                                                       static_cast<int>(e - b + 1));
+        }
+        return {"EFFECT", name};
+    }
+
+    // ---- Other magic-identifiable binary formats without a lu-assets reader yet, or
+    // where a reader exists but full parsing isn't worth it here. ----
+    if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') return {"PNG", ""};
+    if (starts_with(data, "DDS ")) return {"DDS", ""};
+    if (starts_with(data, "FSB")) return {"FSB", ""};
+    if (starts_with(data, "FEV")) return {"FEV", ""};
+    if (starts_with(data, "ndpk")) return {"PK", ""};       // nested PK archive
+    if (starts_with(data, "sd0")) return {"SD0", ""};       // sd0-wrapped-in-sd0 (rare)
+    if (starts_with(data, "CFX") || starts_with(data, "FWS") || starts_with(data, "CWS"))
+        return {"GFX", ""};                                  // Scaleform GFX/SWF
+    if (data[0] == 0xFF && data[1] == 0xD8) return {"JPEG", ""};
+    if (m32 == 0x57E0E057) return {"HKX", ""};              // Havok packfile
+    if (starts_with(data, "\x1BLua")) return {"LUA", ""};   // Lua bytecode
+    // Havok "tagfile" format: no fixed magic, but every known .hkx tagfile in this corpus
+    // contains "hkRootLevelContainer" (or another hk*Container/hkClass tag) near the
+    // start of the section-tag stream.
+    {
+        std::string_view head(reinterpret_cast<const char*>(data.data()),
+                               std::min(data.size(), size_t(256)));
+        if (head.find("hkRootLevelContainer") != std::string_view::npos ||
+            head.find("hkClass") != std::string_view::npos) {
+            return {"HKX", ""}; // tagfile variant (distinct on-disk layout from the packfile above)
+        }
+    }
+    if (starts_with(data, "PK\x03\x04")) return {"ZIP", ""};
+
+    // ---- XML-shaped text formats: distinguish by root element instead of a bare "XML"
+    // bucket, since .aud/.lutriggers/.lxfml are all XML but semantically distinct. ----
+    if (data[0] == '<' || (data.size() > 3 && data[0]=='\xEF' && data[1]=='\xBB' && data[2]=='\xBF')) {
+        std::string_view text(reinterpret_cast<const char*>(data.data()),
+                               std::min(data.size(), size_t(512)));
+        if (text.find("<SceneAudioAttributes") != std::string_view::npos) return {"AUD", ""};
+        if (text.find("<triggers") != std::string_view::npos) return {"LUTRIGGERS", ""};
+        if (text.find("<LXFML") != std::string_view::npos) return {"LXFML", ""};
+        return {"XML", ""};
+    }
+
+    // Lua source (heuristic — "--" comment prefix)
+    if (data.size() >= 2 && data[0] == '-' && data[1] == '-') return {"LUA", ""};
+
+    // Recurring "10GB"-prefixed binary blob seen in loose SD0 dumps, structure not yet
+    // identified in lu-assets — flagged explicitly rather than silently bucketed as BIN
+    // so it's easy to find and investigate later.
+    if (starts_with(data, "10GB")) return {"10GB?", ""};
 
     bool isText = true;
     for (size_t i = 0; i < std::min(data.size(), size_t(64)); ++i) {
         if (data[i] == 0) { isText = false; break; }
     }
-    if (isText) return "TXT";
-    return "BIN";
+    if (isText) return {"TXT", ""};
+    return {"BIN", ""};
 }
 
 QString MainWindow::formatSize(uint32_t bytes) const {
@@ -550,15 +773,21 @@ QString MainWindow::formatSize(uint32_t bytes) const {
 void MainWindow::extractEntry(int packIdx, int entryIdx, const QString& destPath) {
     if (packIdx < 0 || packIdx >= static_cast<int>(packs_.size())) return;
     try {
-        auto data = packs_[packIdx].archive->extract(static_cast<size_t>(entryIdx));
+        const auto& pack = packs_[packIdx];
+        std::vector<uint8_t> extracted;
+        const std::vector<uint8_t>* data = &pack.loose_data;
+        if (pack.archive) {
+            extracted = pack.archive->extract(static_cast<size_t>(entryIdx));
+            data = &extracted;
+        }
         QFile out(destPath);
         if (!out.open(QIODevice::WriteOnly)) {
             QMessageBox::warning(this, "Error",
                 QString("Could not write:\n%1").arg(destPath));
             return;
         }
-        out.write(reinterpret_cast<const char*>(data.data()),
-                  static_cast<qint64>(data.size()));
+        out.write(reinterpret_cast<const char*>(data->data()),
+                  static_cast<qint64>(data->size()));
     } catch (const std::exception& e) {
         QMessageBox::warning(this, "Error",
             QString("Extraction failed:\n%1").arg(e.what()));
@@ -629,6 +858,14 @@ void MainWindow::onExtractAll() {
 
     int count = 0;
     for (int pi = 0; pi < static_cast<int>(packs_.size()); ++pi) {
+        if (!packs_[pi].archive) {
+            // Loose SD0-folder mode: one synthetic entry (index 0) per pack.
+            QFileInfo fi(dir + "/" + packs_[pi].loose_original_name);
+            fi.absoluteDir().mkpath(".");
+            extractEntry(pi, 0, fi.absoluteFilePath());
+            count++;
+            continue;
+        }
         packs_[pi].archive->for_each([&](size_t index, const lu::assets::PackIndexEntry& entry) {
             QString name = resolveFilename(entry.crc);
             if (name.isEmpty())
@@ -660,16 +897,20 @@ void MainWindow::onSearchChanged(const QString& text) {
                 auto* child = top->child(j);
                 bool match = lower.isEmpty() ||
                              child->text(0).toLower().contains(lower) ||
-                             child->text(3).toLower().contains(lower);
+                             child->text(3).toLower().contains(lower) ||
+                             child->text(4).toLower().contains(lower);
                 child->setHidden(!match);
                 if (match) anyVisible = true;
             }
             top->setHidden(!anyVisible && !lower.isEmpty());
         } else {
-            // Single-pack mode entry
+            // Single-pack mode entry (also covers loose SD0-folder rows, whose recovered
+            // content name lives in column 4 — the only searchable name they have besides
+            // their content hash).
             bool match = lower.isEmpty() ||
                          top->text(0).toLower().contains(lower) ||
-                         top->text(3).toLower().contains(lower);
+                         top->text(3).toLower().contains(lower) ||
+                         top->text(4).toLower().contains(lower);
             top->setHidden(!match);
         }
     }
@@ -681,17 +922,21 @@ void MainWindow::onItemDoubleClicked(QTreeWidgetItem* item, int /*column*/) {
     int ei = item->data(0, Qt::UserRole + 1).toInt();
     if (ei < 0 || pi < 0 || pi >= static_cast<int>(packs_.size())) return;
 
-    // Detect type if not already set
-    if (item->text(3).isEmpty()) {
+    // Detect type if not already set (loose SD0 packs already have it set in buildTree)
+    if (item->text(3).isEmpty() && packs_[pi].archive) {
         try {
             auto data = packs_[pi].archive->extract(static_cast<size_t>(ei));
-            item->setText(3, detectFileType(data));
+            DetectedFile detected = detectFile(data);
+            item->setText(3, detected.type);
+            if (!detected.name.isEmpty()) item->setText(4, detected.name);
         } catch (...) {}
     }
 
     statusBar()->showMessage(
-        QString("%1: %2, type: %3")
-            .arg(item->text(0), item->text(1), item->text(3)), 5000);
+        QString("%1: %2, type: %3%4")
+            .arg(item->text(0), item->text(1), item->text(3),
+                 item->text(4).isEmpty() ? QString() : QString(" (%1)").arg(item->text(4))),
+        5000);
 }
 
 void MainWindow::onContextMenu(const QPoint& pos) {
@@ -709,8 +954,12 @@ void MainWindow::onContextMenu(const QPoint& pos) {
             int idx = item->data(0, Qt::UserRole + 1).toInt();
             if (pi < 0 || pi >= static_cast<int>(packs_.size())) return;
             try {
-                auto data = packs_[pi].archive->extract(static_cast<size_t>(idx));
-                item->setText(3, detectFileType(data));
+                const auto& pack = packs_[pi];
+                DetectedFile detected = pack.archive
+                    ? detectFile(pack.archive->extract(static_cast<size_t>(idx)))
+                    : detectFile(pack.loose_data);
+                item->setText(3, detected.type);
+                if (!detected.name.isEmpty()) item->setText(4, detected.name);
             } catch (...) {}
         });
     }
