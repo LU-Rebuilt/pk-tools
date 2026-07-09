@@ -5,6 +5,7 @@
 #include "gamebryo/kfm/kfm_reader.h"
 #include "gamebryo/settings/settings_reader.h"
 #include "netdevil/zone/luz/luz_reader.h"
+#include "netdevil/zone/lvl/lvl_reader.h"
 #include "netdevil/common/ldf/ldf_reader.h"
 #include "forkparticle/psb/psb_reader.h"
 #include "lego/brick_geometry/brick_geometry.h"
@@ -652,6 +653,27 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
         }
     }
 
+    // ---- Old pre-chunked LVL (no CHNK framing, version < ~38 in shipped clients but
+    // seen up to 42/43 in this corpus) — fully parsed. What first looked like an
+    // unrecognized "float-table" blob turned out to be complete, valid old-format .lvl
+    // files (lvl_parse's old_format path): the "u16==u16" header pair I kept seeing is
+    // just header_version/data_version written twice, not a distinct magic. Sanity-gate
+    // on a plausible version range and a nonzero header/object count before trusting the
+    // match, since lvl_parse's old-format path has no magic bytes to anchor on and would
+    // otherwise risk false positives on unrelated binary data. ----
+    if (data.size() >= 8) {
+        uint16_t hv = static_cast<uint16_t>(data[0] | (data[1] << 8));
+        uint16_t dv = static_cast<uint16_t>(data[2] | (data[3] << 8));
+        if (hv == dv && hv >= 20 && hv <= 45) {
+            try {
+                auto lvl = lu::assets::lvl_parse(std::span<const uint8_t>(data.data(), data.size()));
+                if (lvl.old_format && (!lvl.objects.empty() || !lvl.particles.empty())) {
+                    return {"LVL", ""}; // no name carried; raw_path lives in the paired .luz
+                }
+            } catch (const std::exception&) {}
+        }
+    }
+
     // ---- .settings (NiKFMTool binary) — u8-length-prefixed version string as the first
     // field (originally spotted as "2.3.0"/"2.3.2", but the reader makes no version
     // assumption, and "2.2.2" files exist too — verify structurally instead of pinning
@@ -792,56 +814,6 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
 
     // Lua source (heuristic — "--" comment prefix)
     if (data.size() >= 2 && data[0] == '-' && data[1] == '-') return {"LUA", ""};
-
-    // ---- Serialized LVL object/environment-block fragment (no LVL container framing) —
-    // internal/editor dumps sometimes save an LWOGameObject or environment record
-    // standalone, outside any .lvl file. Detected by scanning for the exact on-disk
-    // pattern LvlObject::config uses (u32 char_count + char_count x UTF-16LE chars) that
-    // decodes to LDF text (see lvl_reader.cpp's read_object_config) — this is a heuristic
-    // scan of unframed data, not a structural parse, so it's reported as a fragment with
-    // whatever readable content it recovers (an LDF key or referenced asset path), not a
-    // fully decoded object. ----
-    {
-        QString foundName;
-        int ldfHits = 0;
-        for (size_t i = 0; i + 4 <= data.size() && foundName.isEmpty(); ++i) {
-            uint32_t charCount = read_u32le(data, i);
-            if (charCount == 0 || charCount > 512) continue;
-            size_t strStart = i + 4;
-            if (strStart + static_cast<size_t>(charCount) * 2 > data.size()) continue;
-
-            std::string ascii;
-            ascii.reserve(charCount);
-            bool allAscii = true;
-            for (uint32_t c = 0; c < charCount; ++c) {
-                uint16_t wc = static_cast<uint16_t>(data[strStart + c * 2] |
-                                                    (data[strStart + c * 2 + 1] << 8));
-                if (wc == 0 || wc > 126) { allAscii = false; break; }
-                ascii += static_cast<char>(wc);
-            }
-            if (!allAscii || ascii.empty()) continue;
-
-            // A referenced asset path (readable directly) or LDF text (key=type:value).
-            if (ascii.find(".nif") != std::string::npos ||
-                ascii.find(".lvl") != std::string::npos ||
-                ascii.find('\\') != std::string::npos) {
-                foundName = QString::fromStdString(ascii);
-            } else if (ascii.find('=') != std::string::npos) {
-                try {
-                    auto entries = lu::assets::ldf_parse(ascii);
-                    if (!entries.empty()) {
-                        ldfHits++;
-                        if (foundName.isEmpty()) {
-                            foundName = QString::fromStdString(entries.front().key);
-                        }
-                    }
-                } catch (const std::exception&) {}
-            }
-        }
-        if (!foundName.isEmpty() || ldfHits > 0) {
-            return {"LVL-fragment", foundName};
-        }
-    }
 
     // ---- Serialized FMOD category-tree / mixer snapshot fragment — a different on-disk
     // string convention (u32 count + u32 char_count + char_count x plain ASCII bytes, no
