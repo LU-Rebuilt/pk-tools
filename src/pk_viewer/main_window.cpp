@@ -5,6 +5,7 @@
 #include "gamebryo/kfm/kfm_reader.h"
 #include "gamebryo/settings/settings_reader.h"
 #include "netdevil/zone/luz/luz_reader.h"
+#include "netdevil/common/ldf/ldf_reader.h"
 #include "forkparticle/psb/psb_reader.h"
 #include "lego/brick_geometry/brick_geometry.h"
 
@@ -792,6 +793,78 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
     // Lua source (heuristic — "--" comment prefix)
     if (data.size() >= 2 && data[0] == '-' && data[1] == '-') return {"LUA", ""};
 
+    // ---- Serialized LVL object/environment-block fragment (no LVL container framing) —
+    // internal/editor dumps sometimes save an LWOGameObject or environment record
+    // standalone, outside any .lvl file. Detected by scanning for the exact on-disk
+    // pattern LvlObject::config uses (u32 char_count + char_count x UTF-16LE chars) that
+    // decodes to LDF text (see lvl_reader.cpp's read_object_config) — this is a heuristic
+    // scan of unframed data, not a structural parse, so it's reported as a fragment with
+    // whatever readable content it recovers (an LDF key or referenced asset path), not a
+    // fully decoded object. ----
+    {
+        QString foundName;
+        int ldfHits = 0;
+        for (size_t i = 0; i + 4 <= data.size() && foundName.isEmpty(); ++i) {
+            uint32_t charCount = read_u32le(data, i);
+            if (charCount == 0 || charCount > 512) continue;
+            size_t strStart = i + 4;
+            if (strStart + static_cast<size_t>(charCount) * 2 > data.size()) continue;
+
+            std::string ascii;
+            ascii.reserve(charCount);
+            bool allAscii = true;
+            for (uint32_t c = 0; c < charCount; ++c) {
+                uint16_t wc = static_cast<uint16_t>(data[strStart + c * 2] |
+                                                    (data[strStart + c * 2 + 1] << 8));
+                if (wc == 0 || wc > 126) { allAscii = false; break; }
+                ascii += static_cast<char>(wc);
+            }
+            if (!allAscii || ascii.empty()) continue;
+
+            // A referenced asset path (readable directly) or LDF text (key=type:value).
+            if (ascii.find(".nif") != std::string::npos ||
+                ascii.find(".lvl") != std::string::npos ||
+                ascii.find('\\') != std::string::npos) {
+                foundName = QString::fromStdString(ascii);
+            } else if (ascii.find('=') != std::string::npos) {
+                try {
+                    auto entries = lu::assets::ldf_parse(ascii);
+                    if (!entries.empty()) {
+                        ldfHits++;
+                        if (foundName.isEmpty()) {
+                            foundName = QString::fromStdString(entries.front().key);
+                        }
+                    }
+                } catch (const std::exception&) {}
+            }
+        }
+        if (!foundName.isEmpty() || ldfHits > 0) {
+            return {"LVL-fragment", foundName};
+        }
+    }
+
+    // ---- Serialized FMOD category-tree / mixer snapshot fragment — a different on-disk
+    // string convention (u32 count + u32 char_count + char_count x plain ASCII bytes, no
+    // UTF-16), matching FevEventCategory's "master/..." category paths but as a standalone
+    // cache file rather than embedded in a .fev project. Heuristic scan, same caveat as
+    // above. ----
+    if (data.size() >= 8) {
+        uint32_t count = read_u32le(data, 0);
+        uint32_t strLen = read_u32le(data, 4);
+        if (count > 0 && count < 100000 && strLen > 0 && strLen <= 256 &&
+            8 + strLen <= data.size()) {
+            bool printable = true;
+            for (uint32_t c = 0; c < strLen; ++c) {
+                uint8_t ch = data[8 + c];
+                if (ch != 0 && (ch < 32 || ch > 126)) { printable = false; break; }
+            }
+            std::string_view text(reinterpret_cast<const char*>(data.data() + 8), strLen);
+            if (printable && text.find("master/") != std::string_view::npos) {
+                return {"FMOD-fragment", QString::fromUtf8(text.data(),
+                                                            static_cast<int>(text.size()))};
+            }
+        }
+    }
 
     bool isText = true;
     for (size_t i = 0; i < std::min(data.size(), size_t(64)); ++i) {
