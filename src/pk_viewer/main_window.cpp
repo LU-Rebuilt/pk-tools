@@ -7,6 +7,8 @@
 #include "netdevil/zone/luz/luz_reader.h"
 #include "netdevil/zone/lvl/lvl_reader.h"
 #include "netdevil/zone/lvl/lvl_writer.h"
+#include "microsoft/tga/tga_reader.h"
+#include "microsoft/tga/tga_writer.h"
 #include "netdevil/common/ldf/ldf_reader.h"
 #include "forkparticle/psb/psb_reader.h"
 #include "lego/brick_geometry/brick_geometry.h"
@@ -680,6 +682,32 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
                 }
             } catch (const std::exception&) {}
         }
+    }
+
+    // ---- TGA (structural, no magic bytes at all — has to be attempted rather than
+    // sniffed). tga_parse accepts any buffer >= 18 bytes with no sanity check on its own,
+    // so a round-trip alone would be a near-tautology (it just replays header+payload
+    // bytes verbatim); require a real width/height/bpp combination too. Found by chasing
+    // down what turned out to be a real, if oddly-headered, texture: two files that
+    // looked like an unknown 44-byte-header raster were actually plain 128x128/64x64
+    // 24bpp TGAs (verified via the trailing "TRUEVISION-XFILE." 2.0 footer signature) —
+    // tga_parse just has no magic to recognize them by. A third near-identical-looking
+    // trio decodes to width=0/bpp=0 at the real TGA field offsets and is correctly
+    // rejected here — those are a different, still-unidentified format. ----
+    if (data.size() >= 18) {
+        try {
+            auto tga = lu::assets::tga_parse(std::span<const uint8_t>(data.data(), data.size()));
+            bool plausibleBpp = tga.bits_per_pixel == 8 || tga.bits_per_pixel == 16 ||
+                               tga.bits_per_pixel == 24 || tga.bits_per_pixel == 32;
+            bool plausibleType = tga.image_type <= 3 || (tga.image_type >= 9 && tga.image_type <= 11);
+            if (tga.width > 0 && tga.height > 0 && plausibleBpp && plausibleType) {
+                auto rewritten = lu::assets::tga_write(tga);
+                if (rewritten.size() == data.size() &&
+                    std::memcmp(rewritten.data(), data.data(), data.size()) == 0) {
+                    return {"TGA", QString("%1x%2").arg(tga.width).arg(tga.height)};
+                }
+            }
+        } catch (const std::exception&) {}
     }
 
     // ---- .settings (NiKFMTool binary) — u8-length-prefixed version string as the first
