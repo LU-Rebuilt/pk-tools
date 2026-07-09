@@ -762,6 +762,21 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
     if (starts_with(data, "8BPS")) return {"PSD", ""};
     if (starts_with(data, "MZ")) return {"EXE", ""}; // PE executable/DLL
 
+    // ---- NFF (NetDevil bitmap font) — magic bytes "NFF\0" (0x0046464E as a little-endian
+    // u32) + version(u32) + font-name string(u32 len + chars) + point size(u32) + a
+    // glyph/charmap table. No lu-assets reader exists (found via Ghidra RE of the client's
+    // font loader — the call chain has no named symbols beyond the top-level magic check,
+    // so this is magic-only detection, not a full parser); the font name is a real, useful
+    // display name straight from the header. ----
+    if (data.size() >= 12 && read_u32le(data, 0) == 0x0046464Eu) {
+        uint32_t nameLen = read_u32le(data, 8);
+        QString name;
+        if (nameLen > 0 && nameLen <= 256 && 12 + nameLen <= data.size()) {
+            name = QString::fromUtf8(reinterpret_cast<const char*>(data.data() + 12), nameLen);
+        }
+        return {"NFF", name};
+    }
+
     // ---- XML-shaped text formats: distinguish by root element instead of a bare "XML"
     // bucket, since .aud/.lutriggers/.lxfml are all XML but semantically distinct. ----
     if (data[0] == '<' || (data.size() > 3 && data[0]=='\xEF' && data[1]=='\xBB' && data[2]=='\xBF')) {
