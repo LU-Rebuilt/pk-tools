@@ -6,6 +6,7 @@
 #include "gamebryo/settings/settings_reader.h"
 #include "netdevil/zone/luz/luz_reader.h"
 #include "netdevil/zone/lvl/lvl_reader.h"
+#include "netdevil/zone/lvl/lvl_writer.h"
 #include "netdevil/common/ldf/ldf_reader.h"
 #include "forkparticle/psb/psb_reader.h"
 #include "lego/brick_geometry/brick_geometry.h"
@@ -657,18 +658,25 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
     // seen up to 42/43 in this corpus) — fully parsed. What first looked like an
     // unrecognized "float-table" blob turned out to be complete, valid old-format .lvl
     // files (lvl_parse's old_format path): the "u16==u16" header pair I kept seeing is
-    // just header_version/data_version written twice, not a distinct magic. Sanity-gate
-    // on a plausible version range and a nonzero header/object count before trusting the
-    // match, since lvl_parse's old-format path has no magic bytes to anchor on and would
-    // otherwise risk false positives on unrelated binary data. ----
+    // just header_version/data_version written twice, not a distinct magic. lvl_parse's
+    // old-format path has no magic bytes to anchor on, so trust is established by a
+    // round-trip: lvl_write(lvl_parse(data)) must reproduce data exactly. That's a much
+    // stronger signal than "did it throw" — sequential binary parsers can walk garbage
+    // to a plausible-looking EOF; reproducing every byte on the way back out essentially
+    // can't happen by chance. (An earlier version of this check required a nonempty
+    // object/particle count, which wrongly rejected legitimately empty scenes.) ----
     if (data.size() >= 8) {
         uint16_t hv = static_cast<uint16_t>(data[0] | (data[1] << 8));
         uint16_t dv = static_cast<uint16_t>(data[2] | (data[3] << 8));
         if (hv == dv && hv >= 20 && hv <= 45) {
             try {
                 auto lvl = lu::assets::lvl_parse(std::span<const uint8_t>(data.data(), data.size()));
-                if (lvl.old_format && (!lvl.objects.empty() || !lvl.particles.empty())) {
-                    return {"LVL", ""}; // no name carried; raw_path lives in the paired .luz
+                if (lvl.old_format) {
+                    auto rewritten = lu::assets::lvl_write(lvl);
+                    if (rewritten.size() == data.size() &&
+                        std::memcmp(rewritten.data(), data.data(), data.size()) == 0) {
+                        return {"LVL", ""}; // no name carried; raw_path lives in the paired .luz
+                    }
                 }
             } catch (const std::exception&) {}
         }
