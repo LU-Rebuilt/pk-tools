@@ -12,7 +12,7 @@
 #include "fmod/fsb/fsb_reader.h"
 #include "netdevil/common/ldf/ldf_reader.h"
 #include "forkparticle/psb/psb_reader.h"
-#include "lego/brick_geometry/brick_geometry.h"
+#include "lego/brick_geometry/brick_geometry_reader.h"
 
 #include <QMenuBar>
 #include <QStatusBar>
