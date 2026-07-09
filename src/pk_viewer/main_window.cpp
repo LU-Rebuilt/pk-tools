@@ -822,6 +822,17 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
     if (data.size() >= 3 && data[0] == 0x1F && data[1] == 0x8B && data[2] == 0x08) return {"GZIP", ""};
     if (starts_with(data, "MZ")) return {"EXE", ""}; // PE executable/DLL
 
+    // ---- Compiled D3D9 effect (.fxo) — magic bytes 0x01 0x09 0xFF 0xFE, confirmed by the
+    // standard DirectX Effects Framework semantic names found in the payload
+    // (g_matWorldViewProj/WORLDVIEWPROJECTION, g_matWorld/WORLD, g_viewInverse/
+    // VIEWINVERSE, g_materialDiffuse/MATERIALDIFFUSE, ...). lu-assets deliberately has no
+    // .fxo reader — the client remake renders through bgfx's own .sc shaders and will
+    // never consume these — so this is magic-only identification, not a revived parser. ----
+    if (data.size() >= 4 && data[0] == 0x01 && data[1] == 0x09 &&
+        data[2] == 0xFF && data[3] == 0xFE) {
+        return {"FXO", ""};
+    }
+
     // ---- NFF (NetDevil bitmap font) — magic bytes "NFF\0" (0x0046464E as a little-endian
     // u32) + version(u32) + font-name string(u32 len + chars) + point size(u32) + a
     // glyph/charmap table. No lu-assets reader exists (found via Ghidra RE of the client's
