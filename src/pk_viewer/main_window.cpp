@@ -833,6 +833,19 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
         return {"FXO", ""};
     }
 
+    // ---- Windows .cur/.ico (ICONDIR header) — idReserved(u16)=0, idType(u16)=1(icon) or
+    // 2(cursor), idCount(u16)>0. What looked like an unidentified 62-byte-header raster
+    // (RGBA color block + a trailing 32*32/8=128-byte block matching a 1bpp AND mask
+    // exactly) turned out to be a plain Windows cursor file — confirmed both by the
+    // `file` command ("MS Windows cursor resource, 32x32") and by the embedded
+    // BITMAPINFOHEADER (the "28 00 00 00" 40-byte header size at the expected offset)
+    // matching the standard ICONDIR+ICONDIRENTRY+DIB layout byte-for-byte. ----
+    if (data.size() >= 6 && data[0] == 0 && data[1] == 0 &&
+        (data[2] == 1 || data[2] == 2) && data[3] == 0 &&
+        (data[4] | (data[5] << 8)) > 0) {
+        return {data[2] == 2 ? "CUR" : "ICO", ""};
+    }
+
     // ---- NFF (NetDevil bitmap font) — magic bytes "NFF\0" (0x0046464E as a little-endian
     // u32) + version(u32) + font-name string(u32 len + chars) + point size(u32) + a
     // glyph/charmap table. No lu-assets reader exists (found via Ghidra RE of the client's
