@@ -864,6 +864,26 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
         return {data[2] == 2 ? "CUR" : "ICO", ""};
     }
 
+    // ---- Windows Shell Link (.lnk) — HeaderSize(u32)=76 (0x4c) followed by the fixed
+    // LinkCLSID 00021401-0000-0000-C000-000000000046. The last genuinely mysterious file
+    // in the sandbox-sd0 corpus (981 bytes, valid-looking FILETIME timestamps but no
+    // second sample to cross-reference) turned out to be exactly this: a real Windows
+    // shortcut (confirmed structurally and independently via `file`), byte-identical to
+    // grumpies-enemies.lnk sitting in a ForkParticle effects folder in every properly-
+    // named client tree — an artist's stray desktop/Explorer shortcut into their local
+    // working directory (C:\source\lwo\...\Angelo_V\Projects\3D\Grumpies-enemies),
+    // accidentally packaged with the shipped assets rather than an LU-specific format. ----
+    {
+        static constexpr uint8_t kLnkClsid[16] = {
+            0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+        };
+        if (data.size() >= 20 && read_u32le(data, 0) == 76 &&
+            std::memcmp(data.data() + 4, kLnkClsid, 16) == 0) {
+            return {"LNK", ""};
+        }
+    }
+
     // ---- NFF (NetDevil bitmap font) — magic bytes "NFF\0" (0x0046464E as a little-endian
     // u32) + version(u32) + font-name string(u32 len + chars) + point size(u32) + a
     // glyph/charmap table. No lu-assets reader exists (found via Ghidra RE of the client's
@@ -916,16 +936,17 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
         }
     }
 
-    // Everything past this point genuinely resists identification (checked against a real
-    // 2539-file corpus of loose SD0 dumps). One known residual: a single 981-byte file
-    // containing valid Windows FILETIME timestamps (~2009, LU's dev era) but no second
-    // sample to cross-reference the surrounding field layout — probably an editor/
-    // build-tool asset-metadata record, not written by the game client itself (no Ghidra
-    // hits in legouniverse.exe or LUModelPrep.dll). Everything else in that corpus that
-    // once looked similarly opaque (3 near-maximum-entropy multi-megabyte blobs, magic
-    // "ee c6 0e 00") turned out to be encrypted FSB audio banks, identified by content-
-    // matching against properly-named client trees and confirmed via fsb_decrypt below —
-    // worth remembering before writing off high-entropy data as unidentifiable.
+    // Everything past this point is a genuine fallback, not a known residual: every file in
+    // the real 2539-file sandbox-sd0 corpus is now positively identified above. The two
+    // toughest cases both fell to the same technique — decompress the loose hash-named
+    // file and byte-for-byte content-match it against every properly-named client tree we
+    // have on disk to recover a real filename/extension, then confirm structurally: 3
+    // near-maximum-entropy multi-megabyte blobs (magic "ee c6 0e 00") turned out to be
+    // encrypted FSB audio banks (confirmed via fsb_decrypt below), and the very last
+    // holdout, a 981-byte file with valid Windows FILETIME timestamps, turned out to be a
+    // plain Windows .lnk shortcut (see above) — an artist's stray Explorer shortcut
+    // accidentally bundled into the shipped assets. Worth remembering before writing off
+    // opaque data as unidentifiable.
     bool isText = true;
     for (size_t i = 0; i < std::min(data.size(), size_t(64)); ++i) {
         if (data[i] == 0) { isText = false; break; }
