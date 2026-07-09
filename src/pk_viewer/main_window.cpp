@@ -5,6 +5,7 @@
 #include "gamebryo/kfm/kfm_reader.h"
 #include "netdevil/zone/luz/luz_reader.h"
 #include "forkparticle/psb/psb_reader.h"
+#include "lego/brick_geometry/brick_geometry.h"
 
 #include <QMenuBar>
 #include <QStatusBar>
@@ -671,6 +672,17 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
         }
     }
 
+    // ---- Brick geometry (.g/.g1/.g2) — fully parsed: small mesh files (positions,
+    // normals, optional UVs/bone weights, triangle indices). ----
+    if (m32 == lu::assets::BRICK_GEOM_MAGIC) {
+        try {
+            lu::assets::brick_geometry_parse(std::span<const uint8_t>(data.data(), data.size()));
+            return {"G", ""}; // no name carried in the format itself
+        } catch (const std::exception&) {
+            return {"G?", ""};
+        }
+    }
+
     // ---- FDB (CDClient-style database) — header-only: table_count(u32) followed by a
     // plausible pointer/name-length field. Never fully parsed (files can be 10s of MB). ----
     if (m32 == 4) return {"FDB", ""};
@@ -751,10 +763,6 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
     // Lua source (heuristic — "--" comment prefix)
     if (data.size() >= 2 && data[0] == '-' && data[1] == '-') return {"LUA", ""};
 
-    // Recurring "10GB"-prefixed binary blob seen in loose SD0 dumps, structure not yet
-    // identified in lu-assets — flagged explicitly rather than silently bucketed as BIN
-    // so it's easy to find and investigate later.
-    if (starts_with(data, "10GB")) return {"10GB?", ""};
 
     bool isText = true;
     for (size_t i = 0; i < std::min(data.size(), size_t(64)); ++i) {
