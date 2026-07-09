@@ -3,6 +3,7 @@
 
 #include "gamebryo/nif/nif_reader.h"
 #include "gamebryo/kfm/kfm_reader.h"
+#include "gamebryo/settings/settings_reader.h"
 #include "netdevil/zone/luz/luz_reader.h"
 #include "forkparticle/psb/psb_reader.h"
 #include "lego/brick_geometry/brick_geometry.h"
@@ -30,6 +31,7 @@
 #include <algorithm>
 #include <mutex>
 #include <cstring>
+#include <cctype>
 #include <string_view>
 
 namespace pk_viewer {
@@ -649,10 +651,19 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
         }
     }
 
-    // ---- .settings (NiKFMTool binary) — matches the u8(5)+"2.3."... version-string
-    // signature identified while adding pki_write's round-trip coverage. ----
-    if (data.size() >= 6 && data[0] == 5 && std::memcmp(data.data() + 1, "2.3.", 4) == 0) {
-        return {"SET", ""};
+    // ---- .settings (NiKFMTool binary) — u8-length-prefixed version string as the first
+    // field (originally spotted as "2.3.0"/"2.3.2", but the reader makes no version
+    // assumption, and "2.2.2" files exist too — verify structurally instead of pinning
+    // to one version string). ----
+    if (data.size() >= 2 && data[0] >= 3 && data[0] <= 16 &&
+        static_cast<size_t>(data[0]) + 1 <= data.size() &&
+        std::isdigit(data[1]) && data[2] == '.') {
+        try {
+            lu::assets::settings_parse(std::span<const uint8_t>(data.data(), data.size()));
+            return {"SET", ""};
+        } catch (const std::exception&) {
+            // Fall through — a digit+'.' start doesn't guarantee this is really .settings.
+        }
     }
 
     // ---- Terrain .raw (chunked, version >= 30) — header-only: u16 version, u8 dev,
@@ -748,6 +759,8 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
         }
     }
     if (starts_with(data, "PK\x03\x04")) return {"ZIP", ""};
+    if (starts_with(data, "8BPS")) return {"PSD", ""};
+    if (starts_with(data, "MZ")) return {"EXE", ""}; // PE executable/DLL
 
     // ---- XML-shaped text formats: distinguish by root element instead of a bare "XML"
     // bucket, since .aud/.lutriggers/.lxfml are all XML but semantically distinct. ----
