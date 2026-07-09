@@ -9,6 +9,7 @@
 #include "netdevil/zone/lvl/lvl_writer.h"
 #include "microsoft/tga/tga_reader.h"
 #include "microsoft/tga/tga_writer.h"
+#include "fmod/fsb/fsb_reader.h"
 #include "netdevil/common/ldf/ldf_reader.h"
 #include "forkparticle/psb/psb_reader.h"
 #include "lego/brick_geometry/brick_geometry.h"
@@ -798,6 +799,23 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
     if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') return {"PNG", ""};
     if (starts_with(data, "DDS ")) return {"DDS", ""};
     if (starts_with(data, "FSB")) return {"FSB", ""};
+
+    // ---- Encrypted FSB (FMOD Sample Bank) — LU's shipped .fsb files are XOR+bit-reversed
+    // over the ENTIRE file (fsb_decrypt, key "1024442297" — recovered from fmodex.dll
+    // FUN_10040d7e), so they carry no visible "FSB4"/"FSB5" magic at rest. What looked
+    // like 3 opaque, near-maximum-entropy multi-megabyte blobs turned out to be exactly
+    // this: byte-for-byte identical to interacts_non-streaming.fsb,
+    // ambience_pet_rock_non-streaming.fsb, and ambience_spaceship_streaming.fsb found by
+    // content-matching against properly-named client trees. Decrypt on a scratch copy
+    // (fsb_decrypt mutates in place) and confirm the real magic appears before trusting
+    // it, since running this against arbitrary non-FSB high-entropy data would otherwise
+    // risk a false positive from bit-reversal alone. ----
+    if (data.size() >= 48) {
+        std::vector<uint8_t> scratch(data.begin(), data.begin() + std::min(data.size(), size_t(4096)));
+        if (lu::assets::fsb_decrypt(scratch)) {
+            return {"FSB", ""}; // encrypted — full parse would need the whole file decrypted
+        }
+    }
     if (starts_with(data, "FEV")) return {"FEV", ""};
     if (starts_with(data, "ndpk")) return {"PK", ""};       // nested PK archive
     if (starts_with(data, "sd0")) return {"SD0", ""};       // sd0-wrapped-in-sd0 (rare)
@@ -899,17 +917,15 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
     }
 
     // Everything past this point genuinely resists identification (checked against a real
-    // 2539-file corpus of loose SD0 dumps — see feedback_no_luptop_mentions/project memory
-    // for the investigation). Two known residual shapes, left as BIN/TXT rather than
-    // guessed:
-    //   - magic "ee c6 0e 00", 3.6-12MB, entropy ~7.9-8.0 bits/byte throughout (no Ghidra
-    //     hit, no readable strings, not re-decompressible as zlib/sd0) — almost certainly
-    //     an inner-compressed or encoded payload (audio/texture codec data), not a
-    //     structured format.
-    //   - a 981-byte one-off containing valid Windows FILETIME timestamps (~2009, LU's
-    //     dev era) but no repeat sample to cross-reference the surrounding field layout —
-    //     probably an editor/build-tool asset-metadata record, not written by the game
-    //     client itself (no Ghidra hits in legouniverse.exe).
+    // 2539-file corpus of loose SD0 dumps). One known residual: a single 981-byte file
+    // containing valid Windows FILETIME timestamps (~2009, LU's dev era) but no second
+    // sample to cross-reference the surrounding field layout — probably an editor/
+    // build-tool asset-metadata record, not written by the game client itself (no Ghidra
+    // hits in legouniverse.exe or LUModelPrep.dll). Everything else in that corpus that
+    // once looked similarly opaque (3 near-maximum-entropy multi-megabyte blobs, magic
+    // "ee c6 0e 00") turned out to be encrypted FSB audio banks, identified by content-
+    // matching against properly-named client trees and confirmed via fsb_decrypt below —
+    // worth remembering before writing off high-entropy data as unidentifiable.
     bool isText = true;
     for (size_t i = 0; i < std::min(data.size(), size_t(64)); ++i) {
         if (data[i] == 0) { isText = false; break; }
