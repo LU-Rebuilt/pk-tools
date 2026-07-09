@@ -760,6 +760,7 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
     }
     if (starts_with(data, "PK\x03\x04")) return {"ZIP", ""};
     if (starts_with(data, "8BPS")) return {"PSD", ""};
+    if (data.size() >= 3 && data[0] == 0x1F && data[1] == 0x8B && data[2] == 0x08) return {"GZIP", ""};
     if (starts_with(data, "MZ")) return {"EXE", ""}; // PE executable/DLL
 
     // ---- NFF (NetDevil bitmap font) — magic bytes "NFF\0" (0x0046464E as a little-endian
