@@ -898,6 +898,18 @@ DetectedFile MainWindow::detectFile(const std::vector<uint8_t>& data) const {
         }
     }
 
+    // Everything past this point genuinely resists identification (checked against a real
+    // 2539-file corpus of loose SD0 dumps — see feedback_no_luptop_mentions/project memory
+    // for the investigation). Two known residual shapes, left as BIN/TXT rather than
+    // guessed:
+    //   - magic "ee c6 0e 00", 3.6-12MB, entropy ~7.9-8.0 bits/byte throughout (no Ghidra
+    //     hit, no readable strings, not re-decompressible as zlib/sd0) — almost certainly
+    //     an inner-compressed or encoded payload (audio/texture codec data), not a
+    //     structured format.
+    //   - a 981-byte one-off containing valid Windows FILETIME timestamps (~2009, LU's
+    //     dev era) but no repeat sample to cross-reference the surrounding field layout —
+    //     probably an editor/build-tool asset-metadata record, not written by the game
+    //     client itself (no Ghidra hits in legouniverse.exe).
     bool isText = true;
     for (size_t i = 0; i < std::min(data.size(), size_t(64)); ++i) {
         if (data[i] == 0) { isText = false; break; }
