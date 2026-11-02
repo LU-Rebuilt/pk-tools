@@ -16,11 +16,11 @@ jobs:
           - os: windows-latest
             name: windows-x86_64
             artifact: pk-tools-windows-x86_64
-          - os: macos-14
+          - os: macos-15
             name: macos-arm64
             artifact: pk-tools-macos-arm64
             cmake_extra: -DCMAKE_OSX_ARCHITECTURES=arm64
-          - os: macos-14
+          - os: macos-15
             name: macos-x86_64
             artifact: pk-tools-macos-x86_64
             cmake_extra: -DCMAKE_OSX_ARCHITECTURES=x86_64
